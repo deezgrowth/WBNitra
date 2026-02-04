@@ -1,88 +1,99 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Feb  4 09:13:56 2026
-
-@author: dtk
-"""
-
 import streamlit as st
 import json
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from openai import OpenAI
 
-# --- PART 1: THE BRAINS (Same logic as before) ---
+# 1. SETUP PAGE CONFIGURATION
+st.set_page_config(page_title="Nitra Support", page_icon="💳")
 
-@st.cache_resource
-def load_and_train_model():
-    """
-    Loads JSON and trains the model. 
-    Cached by Streamlit so it only runs once.
-    """
-    # 1. Load Data
+# 2. LOAD FAQ DATA
+@st.cache_data
+def load_faq():
     try:
         with open('faq_data.json', 'r') as file:
             data = json.load(file)
-        faq_list = data['questions']
+            # Convert JSON list to a string so the AI can read it
+            return json.dumps(data['questions'])
     except FileNotFoundError:
-        return None, None, None
+        st.error("FAQ file not found.")
+        return ""
 
-    # 2. Train Model
-    questions = [item['question'] for item in faq_list]
-    vectorizer = TfidfVectorizer(stop_words='english')
-    tfidf_matrix = vectorizer.fit_transform(questions)
-    
-    return faq_list, vectorizer, tfidf_matrix
+faq_text = load_faq()
 
-def get_response(user_input, faq_list, vectorizer, tfidf_matrix):
-    user_vec = vectorizer.transform([user_input])
-    similarity_scores = cosine_similarity(user_vec, tfidf_matrix)
-    best_match_index = np.argmax(similarity_scores)
-    confidence_score = similarity_scores[0][best_match_index]
-
-    # Threshold
-    if confidence_score < 0.2:
-        return "I'm sorry, I don't have an answer for that. Please contact support."
-    
-    return faq_list[best_match_index]['answer']
-
-# --- PART 2: THE WEB INTERFACE ---
-
-st.title("🤖 Customer Support Bot")
-st.markdown("Ask me about hours, refunds, or shipping!")
-
-# Load the brain
-faq_list, vectorizer, tfidf_matrix = load_and_train_model()
-
-if faq_list is None:
-    st.error("Error: 'faq_data.json' not found. Please create the file in the same directory.")
+# 3. INITIALIZE OPENAI CLIENT
+# This pulls the key safely from Streamlit Secrets
+try:
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+except Exception:
+    st.error("OpenAI API Key is missing. Please add it to Streamlit Secrets.")
     st.stop()
 
-# Initialize chat history in the session state if it doesn't exist
+# 4. SYSTEM PROMPT (The Brain Instructions)
+# This tells the AI who it is and gives it the knowledge base
+system_prompt = f"""
+You are a professional, helpful customer support agent for a fintech company called Nitra.
+Your goal is to answer user questions accurately using ONLY the context provided below.
+
+Rules:
+1. If the answer is found in the CONTEXT, answer politely and concisely.
+2. If the user asks a greeting (Hi, Hello), reply naturally.
+3. If the answer is NOT in the CONTEXT, say: "I'm sorry, I don't have information on that specific topic. Please contact support@nitra.com for further assistance."
+4. Do not make up facts. Stick to the provided data.
+
+CONTEXT:
+{faq_text}
+"""
+
+# 5. UI LAYOUT
+st.title("💳 Nitra Support Assistant")
+st.markdown("Welcome! I can help you with cards, expenses, bill pay, and rewards.")
+
+# 6. CHAT HISTORY SETUP
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display previous chat messages
+# Display previous messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# React to user input
-if prompt := st.chat_input("What is your question?"):
-    # 1. Display user message
+# 7. CHAT LOGIC
+if user_input := st.chat_input("How can I help you today?"):
+    # Show user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    # 2. Add user message to history
-    st.session_state.messages.append({"role": "user", "content": prompt})
+        st.markdown(user_input)
 
-    # 3. Generate Bot Response
-    response = get_response(prompt, faq_list, vectorizer, tfidf_matrix)
-
-    # 4. Display Bot message
+    # Generate AI Response
     with st.chat_message("assistant"):
-        st.markdown(response)
-    
-    # 5. Add bot message to history
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        message_placeholder = st.empty()
+        full_response = ""
+        
+        # Prepare the conversation history for the AI
+        # We start with the System Prompt (Rules + Data)
+        messages_payload = [{"role": "system", "content": system_prompt}]
+        
+        # Add the last few messages from chat history (to keep context)
+        for msg in st.session_state.messages[-5:]: 
+            messages_payload.append(msg)
+
+        try:
+            stream = client.chat.completions.create(
+                model="gpt-4o-mini", # Smart, fast, and cheap
+                messages=messages_payload,
+                stream=True,
+            )
+            
+            # Stream the words as they appear (like ChatGPT)
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    full_response += chunk.choices[0].delta.content
+                    message_placeholder.markdown(full_response + "▌")
+            
+            message_placeholder.markdown(full_response)
+        
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
+            full_response = "I'm having trouble connecting to the server right now."
+
+    # Save AI message to history
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
